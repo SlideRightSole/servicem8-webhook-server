@@ -10,11 +10,16 @@ ServiceM8 Webhook Server
     Quote jobs whose sent quotes have expired, marks them Unsuccessful, and
     sends a Slack DM to Luke with a summary.
 
+3.  Runs a scheduled task **daily at 5 PM AEST** that queries all jobs
+    completed today, groups revenue by technician, and sends a Slack DM
+    to Shannon Rowe with a summary.
+
 Environment variables (set in Render dashboard):
-    SERVICEM8_API_KEY   – ServiceM8 API key  (required)
-    SLACK_CHANNEL_ID    – Slack channel ID for new-enquiry notifications
-    SLACK_DM_USER_ID    – Slack user ID to DM for expired-quote alerts
-    PORT                – TCP port (Render sets this automatically)
+    SERVICEM8_API_KEY       – ServiceM8 API key  (required)
+    SLACK_CHANNEL_ID        – Slack channel ID for new-enquiry notifications
+    SLACK_DM_USER_ID        – Slack user ID to DM for expired-quote alerts (Luke)
+    SLACK_DM_SHANNON_ID     – Slack user ID to DM for daily income report (Shannon)
+    PORT                    – TCP port (Render sets this automatically)
 """
 
 import json
@@ -42,10 +47,21 @@ SERVICEM8_HEADERS = {
 
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0AQCK3SZUG")
 SLACK_DM_USER_ID = os.environ.get("SLACK_DM_USER_ID", "U07B253U868")  # Luke
+SLACK_DM_SHANNON_ID = os.environ.get("SLACK_DM_SHANNON_ID", "U07K1RUAE31")  # Shannon
 
 PORT = int(os.environ.get("PORT", 5000))
 
 AEST = timezone(timedelta(hours=10))
+
+# ── Technician UUID → display-name mapping ────────────────────────────────────
+TECHNICIAN_MAP: dict[str, str] = {
+    "d2c4e758-1f88-42cf-aaf6-20e5997a2c3b": "Adam Spinelli",
+    "d228d76e-8ffa-449a-9ca4-23da2ed21f6b": "Chris Stephenson",
+    "3f4584ed-74cf-4ee4-9890-2396dd877f5b": "Charlie Wright",
+    "5a175074-5801-4b8c-96fc-23e6f0d2c00b": "Martin M",
+    "b909dbb0-3bdd-4129-8e57-21d0b66873ab": "Wayne Googh",
+    "b37f0d70-8dd1-4f2b-9610-23f41e9f12eb": "Darren",
+}
 
 # ── Boilerplate content ────────────────────────────────────────────────────────
 WORK_DONE_DESCRIPTION = (
@@ -400,13 +416,13 @@ def check_expired_quotes() -> None:
             logger.info("Update result for job %s: %s", job_number, update_resp.status_code)
 
             dm_lines.append(
-                f"• *Job {job_number}* — {client_name} — {address}\n"
+                f"\u2022 *Job {job_number}* \u2014 {client_name} \u2014 {address}\n"
                 f"  Quote expired: {job.get('queue_expiry_date', 'N/A')}"
             )
 
         # 3. Send a single DM to Luke with the full summary -------------------
         header = (
-            f":warning: *Expired Quotes — Auto-marked Unsuccessful*\n"
+            f":warning: *Expired Quotes \u2014 Auto-marked Unsuccessful*\n"
             f"_{now.strftime('%A %-d %B %Y, %-I:%M %p')} AEST_\n\n"
             f"The following {len(dm_lines)} job(s) had expired quotes and have "
             f"been automatically set to *Unsuccessful*:\n\n"
@@ -418,6 +434,145 @@ def check_expired_quotes() -> None:
 
     except Exception:
         logger.exception("Unhandled error in expired-quote check")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Scheduled task — daily technician income report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def daily_technician_income_report() -> None:
+    """
+    Scheduled job (5 PM AEST daily): query all jobs completed today,
+    group invoice totals by technician, and DM Shannon Rowe with a summary.
+    """
+    logger.info("=== Daily technician income report started ===")
+    now = datetime.now(AEST)
+    today_str = now.strftime("%Y-%m-%d")
+
+    try:
+        # 1. Fetch all Completed jobs -----------------------------------------
+        resp = _sm8_get("job.json?%24filter=status%20eq%20%27Completed%27")
+        if resp.status_code != 200:
+            logger.error("Failed to fetch Completed jobs: %s", resp.status_code)
+            return
+        all_jobs = resp.json()
+        logger.info("Total Completed jobs fetched: %d", len(all_jobs))
+
+        # 2. Filter to jobs completed today (AEST) ----------------------------
+        todays_jobs: list[dict] = []
+        for job in all_jobs:
+            comp_str = job.get("completion_date", "") or ""
+            if not comp_str or comp_str.startswith("0000"):
+                continue
+            # completion_date is like "2026-03-28 12:47:45"
+            if comp_str[:10] == today_str:
+                todays_jobs.append(job)
+
+        logger.info("Jobs completed today (%s): %d", today_str, len(todays_jobs))
+
+        # 3. Group revenue by technician (completion_actioned_by_uuid) --------
+        tech_totals: dict[str, float] = {}       # uuid -> total
+        tech_job_counts: dict[str, int] = {}      # uuid -> count
+        tech_job_details: dict[str, list] = {}    # uuid -> list of (job_id, amount)
+
+        for job in todays_jobs:
+            tech_uuid = job.get("completion_actioned_by_uuid", "") or ""
+            if not tech_uuid:
+                tech_uuid = "unassigned"
+
+            amount = 0.0
+            try:
+                amount = float(job.get("total_invoice_amount", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+
+            tech_totals[tech_uuid] = tech_totals.get(tech_uuid, 0.0) + amount
+            tech_job_counts[tech_uuid] = tech_job_counts.get(tech_uuid, 0) + 1
+
+            job_id = job.get("generated_job_id", "?")
+            if tech_uuid not in tech_job_details:
+                tech_job_details[tech_uuid] = []
+            tech_job_details[tech_uuid].append((job_id, amount))
+
+        # 4. Build the Slack DM message ----------------------------------------
+        grand_total = sum(tech_totals.values())
+        total_jobs = len(todays_jobs)
+
+        lines: list[str] = []
+        lines.append(f":moneybag: *Daily Technician Income Report*")
+        lines.append(f"_{now.strftime('%A %-d %B %Y')}_ \u2014 {total_jobs} job(s) completed\n")
+
+        if not todays_jobs:
+            lines.append("No jobs were completed today.")
+        else:
+            lines.append("```")
+            lines.append(f"{'Technician':<22} {'Jobs':>5}  {'Revenue':>12}")
+            lines.append(f"{'-' * 22} {'-' * 5}  {'-' * 12}")
+
+            # Sort by revenue descending
+            sorted_techs = sorted(tech_totals.items(), key=lambda x: x[1], reverse=True)
+
+            for tech_uuid, total in sorted_techs:
+                name = TECHNICIAN_MAP.get(tech_uuid, None)
+                if name is None:
+                    # Try to look up the staff name from ServiceM8
+                    if tech_uuid and tech_uuid != "unassigned":
+                        try:
+                            staff_resp = _sm8_get(f"staff/{tech_uuid}.json")
+                            if staff_resp.status_code == 200:
+                                s = staff_resp.json()
+                                name = f"{s.get('first', '')} {s.get('last', '')}".strip()
+                                if not name or name == ".":
+                                    name = tech_uuid[:12]
+                            else:
+                                name = tech_uuid[:12]
+                        except Exception:
+                            name = tech_uuid[:12]
+                    else:
+                        name = "Unassigned"
+
+                count = tech_job_counts.get(tech_uuid, 0)
+                lines.append(f"{name:<22} {count:>5}  ${total:>11,.2f}")
+
+            lines.append(f"{'-' * 22} {'-' * 5}  {'-' * 12}")
+            lines.append(f"{'TOTAL':<22} {total_jobs:>5}  ${grand_total:>11,.2f}")
+            lines.append("```")
+
+            # Add per-technician job breakdown
+            lines.append("")
+            lines.append("*Job Breakdown:*")
+            for tech_uuid, total in sorted_techs:
+                name = TECHNICIAN_MAP.get(tech_uuid, None)
+                if name is None:
+                    if tech_uuid and tech_uuid != "unassigned":
+                        try:
+                            staff_resp = _sm8_get(f"staff/{tech_uuid}.json")
+                            if staff_resp.status_code == 200:
+                                s = staff_resp.json()
+                                name = f"{s.get('first', '')} {s.get('last', '')}".strip()
+                                if not name or name == ".":
+                                    name = tech_uuid[:12]
+                            else:
+                                name = tech_uuid[:12]
+                        except Exception:
+                            name = tech_uuid[:12]
+                    else:
+                        name = "Unassigned"
+
+                details = tech_job_details.get(tech_uuid, [])
+                detail_parts = [f"#{jid} (${amt:,.2f})" for jid, amt in details]
+                lines.append(f"\u2022 *{name}:* {', '.join(detail_parts)}")
+
+        message = "\n".join(lines)
+        _slack_send(SLACK_DM_SHANNON_ID, message)
+
+        logger.info(
+            "=== Daily income report sent — %d jobs, $%.2f total ===",
+            total_jobs, grand_total,
+        )
+
+    except Exception:
+        logger.exception("Unhandled error in daily technician income report")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -507,12 +662,19 @@ def webhook() -> Response:
 
 scheduler = BackgroundScheduler(timezone=AEST)
 
-# Run at 9:00 AM and 5:00 PM AEST every day
+# Expired-quote checks: 9 AM and 5 PM AEST daily
 scheduler.add_job(check_expired_quotes, "cron", hour=9, minute=0, id="expire_quotes_9am")
 scheduler.add_job(check_expired_quotes, "cron", hour=17, minute=0, id="expire_quotes_5pm")
 
+# Daily technician income report: 5 PM AEST daily
+scheduler.add_job(daily_technician_income_report, "cron", hour=17, minute=0,
+                  id="daily_income_report_5pm")
+
 scheduler.start()
-logger.info("APScheduler started — expired-quote checks at 9:00 AM and 5:00 PM AEST daily.")
+logger.info(
+    "APScheduler started — expired-quote checks at 9 AM & 5 PM AEST, "
+    "daily income report at 5 PM AEST."
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

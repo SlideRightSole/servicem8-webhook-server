@@ -11,3 +11,5 @@ services:
         value: C0AQCK3SZUG
       - key: SLACK_DM_USER_ID
         value: U07B253U868
+      - key: SLACK_DM_SHANNON_ID
+        value: U07K1RUAE31
