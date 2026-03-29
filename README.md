@@ -34,7 +34,7 @@ All heavy processing runs in a background thread so the webhook endpoint returns
 |---|---|
 | **Runtime** | Python 3 |
 | **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120` |
+| **Start Command** | `gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120` |
 
 ### Environment variables
 
@@ -66,7 +66,7 @@ Expected response: `{"success":true}`
 
 ```bash
 pip install -r requirements.txt
-SERVICEM8_API_KEY=your_key SLACK_CHANNEL_ID=your_channel_id python server.py
+SERVICEM8_API_KEY=your_key SLACK_CHANNEL_ID=your_channel_id python app.py
 ```
 
 The server starts on **port 5000** by default. Use [ngrok](https://ngrok.com) or similar to expose it publicly for local testing.
