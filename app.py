@@ -2,9 +2,14 @@
 """
 ServiceM8 Webhook Server
 ========================
-1.  Handles ServiceM8 ``inbox.message_received`` webhook events — converts
-    new enquiries to Quote jobs, stamps the standard template, and posts a
-    Slack notification to #new-enquiry-received.
+1.  Handles ServiceM8 ``inbox.message_received`` webhook events.
+    When a new inbox message arrives the webhook schedules a one-shot
+    check for 10 minutes later.  At that point the message is re-fetched;
+    if it is still unarchived and not yet converted (i.e. no human has
+    manually actioned it) it is converted to a Quote job, stamped with
+    the standard template, and a Slack notification is posted to
+    #new-enquiry-received.  If a human has already actioned it the
+    auto-conversion is skipped.
 
 2.  Runs a scheduled task **twice daily** (9 AM and 5 PM AEST) that finds
     Quote jobs whose sent quotes have expired, marks them Unsuccessful, and
@@ -194,6 +199,11 @@ def _send_new_enquiry_slack(job_number: str, client_name: str, address: str,
     _slack_send(SLACK_CHANNEL_ID, message)
 
 
+# Delay (in minutes) before auto-converting an inbox message to a job.
+# This gives staff time to manually action the message first.
+INBOX_DELAY_MINUTES = int(os.environ.get("INBOX_DELAY_MINUTES", 10))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Webhook processing — new enquiry pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -201,10 +211,12 @@ def _send_new_enquiry_slack(job_number: str, client_name: str, address: str,
 def _process_inbox_message(uuid: str) -> None:
     """
     Full processing pipeline for a single inbox message UUID.
-    Runs in a background thread so the webhook endpoint returns 200 immediately.
+    Called by the one-shot APScheduler job INBOX_DELAY_MINUTES after the
+    webhook fires.  At this point we re-check whether the message has been
+    manually actioned (archived or already converted) and skip if so.
     """
     try:
-        logger.info("=== Processing inbox message %s ===", uuid)
+        logger.info("=== Processing inbox message %s (delayed check) ===", uuid)
 
         # 1. Fetch inbox message -----------------------------------------------
         resp = _sm8_get(f"inboxmessage/{uuid}.json")
@@ -213,14 +225,20 @@ def _process_inbox_message(uuid: str) -> None:
             return
         inbox = resp.json()
         logger.info(
-            "Inbox message: archived=%s, converted_to_job_uuid=%s",
-            inbox.get("archived"),
+            "Inbox message: is_archived=%s, archived_by=%s, converted_to_job_uuid=%s",
+            inbox.get("is_archived"),
+            inbox.get("archived_by_staff_uuid"),
             inbox.get("converted_to_job_uuid"),
         )
 
-        # 2. Guard: skip archived or already-converted messages ----------------
-        if str(inbox.get("archived", "0")) == "1":
-            logger.info("Message %s is archived — skipping.", uuid)
+        # 2. Guard: skip if a human has already actioned the message -----------
+        #    is_archived == "1"  → staff archived it (manually actioned)
+        #    converted_to_job_uuid set → already converted (manually or by us)
+        if str(inbox.get("is_archived", "0")) == "1":
+            logger.info(
+                "Message %s was archived by staff (%s) — skipping auto-conversion.",
+                uuid, inbox.get("archived_by_staff_uuid", "unknown"),
+            )
             return
 
         existing_job = inbox.get("converted_to_job_uuid", "") or ""
@@ -228,9 +246,15 @@ def _process_inbox_message(uuid: str) -> None:
             logger.info("Message %s already converted to job %s — skipping.", uuid, existing_job)
             return
 
+        logger.info(
+            "Message %s is still unactioned after %d minutes — proceeding with auto-conversion.",
+            uuid, INBOX_DELAY_MINUTES,
+        )
+
         # 3. Extract enquiry text ----------------------------------------------
         enquiry_text = (
-            inbox.get("message_body")
+            inbox.get("message_text")
+            or inbox.get("message_body")
             or inbox.get("description")
             or inbox.get("subject")
             or inbox.get("body")
@@ -642,16 +666,30 @@ def webhook() -> Response:
 
     logger.info("Event UUID: %s", uuid)
 
-    # Dedup check
+    # Dedup check — prevent scheduling the same UUID twice
     with _processed_lock:
         if uuid in _processed_uuids:
             logger.info("UUID %s already queued/processed — skipping.", uuid)
             return Response("OK", status=200)
         _processed_uuids.add(uuid)
 
-    # Process asynchronously so we return 200 immediately
-    thread = threading.Thread(target=_process_inbox_message, args=(uuid,), daemon=True)
-    thread.start()
+    # Schedule a one-shot delayed check instead of processing immediately.
+    # After INBOX_DELAY_MINUTES the job re-fetches the message; if a human
+    # has archived or converted it in the meantime, it skips auto-conversion.
+    run_at = datetime.now(AEST) + timedelta(minutes=INBOX_DELAY_MINUTES)
+    job_id = f"inbox_{uuid}"
+    scheduler.add_job(
+        _process_inbox_message,
+        trigger="date",
+        run_date=run_at,
+        args=[uuid],
+        id=job_id,
+        replace_existing=True,
+    )
+    logger.info(
+        "Scheduled delayed processing of inbox message %s at %s AEST (%d min delay).",
+        uuid, run_at.strftime("%H:%M:%S"), INBOX_DELAY_MINUTES,
+    )
 
     return Response("OK", status=200)
 
