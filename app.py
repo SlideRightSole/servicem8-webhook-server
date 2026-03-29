@@ -19,6 +19,11 @@ ServiceM8 Webhook Server
     completed today, groups revenue by technician, and sends a Slack DM
     to Shannon Rowe with a summary.
 
+4.  Runs a **fallback inbox scanner every 15 minutes** that catches any
+    online-booking inbox messages older than 10 minutes that have not been
+    archived or converted.  This is a safety net in case the webhook does
+    not fire.
+
 Environment variables (set in Render dashboard):
     SERVICEM8_API_KEY       – ServiceM8 API key  (required)
     SLACK_CHANNEL_ID        – Slack channel ID for new-enquiry notifications
@@ -337,11 +342,32 @@ def _process_inbox_message(uuid: str) -> None:
 
         # Fall back to inbox message fields if company record is sparse
         if email == "N/A":
-            email = inbox.get("sender_email") or inbox.get("email") or "N/A"
+            email = (
+                inbox.get("from_email")
+                or inbox.get("sender_email")
+                or inbox.get("email")
+                or "N/A"
+            )
         if phone == "N/A":
-            phone = inbox.get("sender_phone") or inbox.get("phone") or "N/A"
+            phone = (
+                inbox.get("sender_phone")
+                or inbox.get("phone")
+                or "N/A"
+            )
         if client_name == "N/A":
-            client_name = inbox.get("sender_name") or inbox.get("name") or "N/A"
+            client_name = (
+                inbox.get("from_name")
+                or inbox.get("sender_name")
+                or inbox.get("name")
+                or "N/A"
+            )
+
+        # Try to extract phone from message_text if still missing
+        if phone == "N/A" and inbox.get("message_text"):
+            import re
+            phone_match = re.search(r'Phone\s+(\d[\d\s]+)', inbox.get("message_text", ""))
+            if phone_match:
+                phone = phone_match.group(1).strip()
 
         # 8. Send Slack notification -------------------------------------------
         _send_new_enquiry_slack(
@@ -360,6 +386,95 @@ def _process_inbox_message(uuid: str) -> None:
 
     except Exception:
         logger.exception("Unhandled error processing inbox message %s", uuid)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Scheduled task — fallback inbox scanner (every 15 minutes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fallback_inbox_scanner() -> None:
+    """
+    Safety-net scheduled job (every 15 minutes).
+    Scans the ServiceM8 inbox for online_booking messages that are:
+      - not archived  (is_archived == "0")
+      - not converted (converted_to_job_uuid is empty)
+      - older than INBOX_DELAY_MINUTES
+    and auto-converts them via the standard pipeline.
+    """
+    logger.info("=== Fallback inbox scanner started ===")
+    now = datetime.now(AEST)
+
+    try:
+        resp = _sm8_get("inboxmessage.json")
+        if resp.status_code != 200:
+            logger.error("Failed to fetch inbox messages: %s", resp.status_code)
+            return
+
+        raw_data = resp.json()
+        # API returns {"messages": [...]} not a flat list
+        if isinstance(raw_data, dict):
+            messages = raw_data.get("messages", [])
+        elif isinstance(raw_data, list):
+            messages = raw_data
+        else:
+            logger.error("Unexpected inbox response type: %s", type(raw_data))
+            return
+
+        logger.info("Inbox messages fetched: %d", len(messages))
+
+        candidates: list[dict] = []
+        for msg in messages:
+            # Only online bookings
+            if msg.get("message_type") != "online_booking":
+                continue
+            # Not archived
+            if str(msg.get("is_archived", "0")) == "1":
+                continue
+            # Not already converted
+            converted = msg.get("converted_to_job_uuid", "") or ""
+            if converted and converted not in ("", "0"):
+                continue
+            # Must be older than INBOX_DELAY_MINUTES
+            ts_str = msg.get("timestamp", "") or ""
+            if not ts_str or ts_str.startswith("0000"):
+                continue
+            try:
+                msg_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                msg_dt = msg_dt.replace(tzinfo=AEST)
+            except ValueError:
+                continue
+            age_minutes = (now - msg_dt).total_seconds() / 60.0
+            if age_minutes < INBOX_DELAY_MINUTES:
+                logger.info(
+                    "Inbox %s is only %.1f min old (< %d) — skipping for now.",
+                    msg["uuid"][:8], age_minutes, INBOX_DELAY_MINUTES,
+                )
+                continue
+
+            candidates.append(msg)
+
+        logger.info(
+            "Fallback scanner found %d unactioned inbox message(s) older than %d min.",
+            len(candidates), INBOX_DELAY_MINUTES,
+        )
+
+        for msg in candidates:
+            uuid = msg["uuid"]
+            # Add to dedup set so the webhook-triggered job won't double-process
+            with _processed_lock:
+                if uuid in _processed_uuids:
+                    logger.info("Fallback: %s already processed — skipping.", uuid[:8])
+                    continue
+                _processed_uuids.add(uuid)
+
+            logger.info("Fallback: processing inbox message %s", uuid)
+            # Run synchronously inside the scheduler thread (one at a time)
+            _process_inbox_message(uuid)
+
+        logger.info("=== Fallback inbox scanner complete ===")
+
+    except Exception:
+        logger.exception("Unhandled error in fallback inbox scanner")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -700,6 +815,10 @@ def webhook() -> Response:
 
 scheduler = BackgroundScheduler(timezone=AEST)
 
+# Fallback inbox scanner: every 15 minutes
+scheduler.add_job(fallback_inbox_scanner, "interval", minutes=15,
+                  id="fallback_inbox_scanner")
+
 # Expired-quote checks: 9 AM and 5 PM AEST daily
 scheduler.add_job(check_expired_quotes, "cron", hour=9, minute=0, id="expire_quotes_9am")
 scheduler.add_job(check_expired_quotes, "cron", hour=17, minute=0, id="expire_quotes_5pm")
@@ -710,7 +829,8 @@ scheduler.add_job(daily_technician_income_report, "cron", hour=17, minute=0,
 
 scheduler.start()
 logger.info(
-    "APScheduler started — expired-quote checks at 9 AM & 5 PM AEST, "
+    "APScheduler started — fallback inbox scanner every 15 min, "
+    "expired-quote checks at 9 AM & 5 PM AEST, "
     "daily income report at 5 PM AEST."
 )
 
