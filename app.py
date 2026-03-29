@@ -35,10 +35,12 @@ Environment variables (set in Render dashboard):
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -61,7 +63,10 @@ SLACK_DM_SHANNON_ID = os.environ.get("SLACK_DM_SHANNON_ID", "U07K1RUAE31")  # Sh
 
 PORT = int(os.environ.get("PORT", 5000))
 
-AEST = timezone(timedelta(hours=10))
+# Use the proper IANA timezone so AEDT (+11) / AEST (+10) transitions are
+# handled automatically — a hardcoded +10:00 offset fires 1 hour late during
+# daylight saving time (October–April).
+AEST = ZoneInfo("Australia/Sydney")
 
 # ── Technician UUID → display-name mapping ────────────────────────────────────
 TECHNICIAN_MAP: dict[str, str] = {
@@ -364,7 +369,6 @@ def _process_inbox_message(uuid: str) -> None:
 
         # Try to extract phone from message_text if still missing
         if phone == "N/A" and inbox.get("message_text"):
-            import re
             phone_match = re.search(r'Phone\s+(\d[\d\s]+)', inbox.get("message_text", ""))
             if phone_match:
                 phone = phone_match.group(1).strip()
