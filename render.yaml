@@ -3,9 +3,11 @@ services:
     name: servicem8-webhook
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --preload
     envVars:
       - key: SERVICEM8_API_KEY
         value: smk-0fa743-cca53e4f1ad199f6-f991a3ae6a206763
       - key: SLACK_CHANNEL_ID
         value: C0AQCK3SZUG
+      - key: SLACK_DM_USER_ID
+        value: U07B253U868

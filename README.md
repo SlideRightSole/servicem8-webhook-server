@@ -1,8 +1,10 @@
 # ServiceM8 Webhook Server
 
-A lightweight Flask webhook server that listens for ServiceM8 **`inbox.message_received`** events and automatically processes new online enquiries.
+A lightweight Flask webhook server that listens for ServiceM8 **`inbox.message_received`** events and automatically processes new online enquiries. It also runs a scheduled task to auto-expire stale quotes.
 
 ## What it does
+
+### Webhook — new enquiry processing
 
 When a new inbox message arrives in ServiceM8 this server will:
 
@@ -15,6 +17,15 @@ When a new inbox message arrives in ServiceM8 this server will:
 7. Post a Slack notification to **#new-enquiry-received** with the job number, client name, address, enquiry text, email, and phone number.
 
 All heavy processing runs in a background thread so the webhook endpoint returns **HTTP 200 immediately**.
+
+### Scheduled task — auto-expire quotes
+
+Twice daily at **9:00 AM** and **5:00 PM AEST** the server will:
+
+1. Query all ServiceM8 jobs with status **Quote** where the quote has been sent.
+2. Check each job's `queue_expiry_date` — if it is in the past, the quote is expired.
+3. Update the job status to **Unsuccessful**.
+4. Send a **Slack DM to Luke** summarising every job that was marked Unsuccessful, including job number, client name, and address.
 
 ---
 
@@ -34,7 +45,9 @@ All heavy processing runs in a background thread so the webhook endpoint returns
 |---|---|
 | **Runtime** | Python 3 |
 | **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120` |
+| **Start Command** | `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --preload` |
+
+> **Note:** Use `--workers 1 --preload` so the APScheduler background scheduler runs exactly once.
 
 ### Environment variables
 
@@ -43,7 +56,8 @@ Set these in Render's **Environment** tab (or they fall back to the defaults alr
 | Variable | Description | Default (fallback) |
 |---|---|---|
 | `SERVICEM8_API_KEY` | ServiceM8 API key | hardcoded in code |
-| `SLACK_CHANNEL_ID` | Slack channel ID for notifications | `C0AQCK3SZUG` |
+| `SLACK_CHANNEL_ID` | Slack channel ID for new-enquiry notifications | `C0AQCK3SZUG` |
+| `SLACK_DM_USER_ID` | Slack user ID for expired-quote DM alerts (Luke) | `U07B253U868` |
 
 ---
 
@@ -66,7 +80,7 @@ Expected response: `{"success":true}`
 
 ```bash
 pip install -r requirements.txt
-SERVICEM8_API_KEY=your_key SLACK_CHANNEL_ID=your_channel_id python app.py
+SERVICEM8_API_KEY=your_key SLACK_CHANNEL_ID=your_channel_id SLACK_DM_USER_ID=your_user_id python app.py
 ```
 
 The server starts on **port 5000** by default. Use [ngrok](https://ngrok.com) or similar to expose it publicly for local testing.

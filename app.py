@@ -2,20 +2,19 @@
 """
 ServiceM8 Webhook Server
 ========================
-Handles ServiceM8 inbox.message_received webhook events.
+1.  Handles ServiceM8 ``inbox.message_received`` webhook events — converts
+    new enquiries to Quote jobs, stamps the standard template, and posts a
+    Slack notification to #new-enquiry-received.
 
-For each new inbox message:
-  1. Verifies the ServiceM8 subscription challenge.
-  2. Fetches the inbox message details.
-  3. Converts the message to a job (Quote status).
-  4. Updates the job description with the standard template.
-  5. Sets the work_done_description boilerplate.
-  6. Sends a Slack notification to #new-enquiry-received.
+2.  Runs a scheduled task **twice daily** (9 AM and 5 PM AEST) that finds
+    Quote jobs whose sent quotes have expired, marks them Unsuccessful, and
+    sends a Slack DM to Luke with a summary.
 
-Environment variables (set these in Render's dashboard):
-  SERVICEM8_API_KEY   – ServiceM8 API key  (required)
-  SLACK_CHANNEL_ID    – Slack channel ID for notifications  (required)
-  PORT                – TCP port to listen on (Render sets this automatically)
+Environment variables (set in Render dashboard):
+    SERVICEM8_API_KEY   – ServiceM8 API key  (required)
+    SLACK_CHANNEL_ID    – Slack channel ID for new-enquiry notifications
+    SLACK_DM_USER_ID    – Slack user ID to DM for expired-quote alerts
+    PORT                – TCP port (Render sets this automatically)
 """
 
 import json
@@ -24,8 +23,10 @@ import os
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, Response, request
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -40,8 +41,11 @@ SERVICEM8_HEADERS = {
 }
 
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0AQCK3SZUG")
+SLACK_DM_USER_ID = os.environ.get("SLACK_DM_USER_ID", "U07B253U868")  # Luke
 
 PORT = int(os.environ.get("PORT", 5000))
+
+AEST = timezone(timedelta(hours=10))
 
 # ── Boilerplate content ────────────────────────────────────────────────────────
 WORK_DONE_DESCRIPTION = (
@@ -116,7 +120,9 @@ _processed_uuids: set = set()
 _processed_lock = threading.Lock()
 
 
-# ── ServiceM8 helpers ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ServiceM8 helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _sm8_get(path: str) -> requests.Response:
     url = f"{SERVICEM8_BASE_URL}/{path}"
@@ -134,21 +140,13 @@ def _sm8_post(path: str, json_data: dict | None = None) -> requests.Response:
     return resp
 
 
-# ── Slack helper ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Slack helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _send_slack(job_number: str, client_name: str, address: str,
-                enquiry_text: str, email: str, phone: str) -> None:
-    """Send a Slack notification via the Manus MCP CLI."""
-    message = (
-        f"*New Online Enquiry Received* :incoming_envelope:\n\n"
-        f"*Job Number:* {job_number}\n"
-        f"*Client Name:* {client_name}\n"
-        f"*Address:* {address}\n"
-        f"*Enquiry:* {enquiry_text}\n"
-        f"*Email:* {email}\n"
-        f"*Phone:* {phone}"
-    )
-    payload = json.dumps({"channel_id": SLACK_CHANNEL_ID, "message": message})
+def _slack_send(channel_id: str, message: str) -> None:
+    """Send a Slack message (channel or DM) via the Manus MCP CLI."""
+    payload = json.dumps({"channel_id": channel_id, "message": message})
     try:
         result = subprocess.run(
             [
@@ -160,12 +158,29 @@ def _send_slack(job_number: str, client_name: str, address: str,
             text=True,
             timeout=30,
         )
-        logger.info("Slack result: %s %s", result.stdout[:300], result.stderr[:200])
+        logger.info("Slack send result: %s %s", result.stdout[:300], result.stderr[:200])
     except Exception as exc:
-        logger.error("Slack notification failed: %s", exc)
+        logger.error("Slack send failed: %s", exc)
 
 
-# ── Core processing logic ──────────────────────────────────────────────────────
+def _send_new_enquiry_slack(job_number: str, client_name: str, address: str,
+                            enquiry_text: str, email: str, phone: str) -> None:
+    """Post a new-enquiry notification to the #new-enquiry-received channel."""
+    message = (
+        f"*New Online Enquiry Received* :incoming_envelope:\n\n"
+        f"*Job Number:* {job_number}\n"
+        f"*Client Name:* {client_name}\n"
+        f"*Address:* {address}\n"
+        f"*Enquiry:* {enquiry_text}\n"
+        f"*Email:* {email}\n"
+        f"*Phone:* {phone}"
+    )
+    _slack_send(SLACK_CHANNEL_ID, message)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Webhook processing — new enquiry pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _process_inbox_message(uuid: str) -> None:
     """
@@ -289,7 +304,7 @@ def _process_inbox_message(uuid: str) -> None:
             client_name = inbox.get("sender_name") or inbox.get("name") or "N/A"
 
         # 8. Send Slack notification -------------------------------------------
-        _send_slack(
+        _send_new_enquiry_slack(
             job_number=job_number,
             client_name=client_name,
             address=address,
@@ -307,7 +322,107 @@ def _process_inbox_message(uuid: str) -> None:
         logger.exception("Unhandled error processing inbox message %s", uuid)
 
 
-# ── Flask routes ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Scheduled task — auto-expire quotes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_client_name(company_uuid: str) -> str:
+    """Fetch the client/company name from ServiceM8."""
+    if not company_uuid:
+        return "N/A"
+    try:
+        resp = _sm8_get(f"company/{company_uuid}.json")
+        if resp.status_code == 200:
+            return resp.json().get("name") or "N/A"
+    except Exception:
+        pass
+    return "N/A"
+
+
+def check_expired_quotes() -> None:
+    """
+    Scheduled job: find all Quote jobs with a sent quote whose
+    queue_expiry_date has passed, mark them Unsuccessful, and DM Luke.
+    """
+    logger.info("=== Expired-quote check started ===")
+    now = datetime.now(AEST)
+
+    try:
+        # 1. Fetch all Quote jobs ---------------------------------------------
+        resp = _sm8_get("job.json?%24filter=status%20eq%20%27Quote%27")
+        if resp.status_code != 200:
+            logger.error("Failed to fetch Quote jobs: %s", resp.status_code)
+            return
+        jobs = resp.json()
+        logger.info("Total Quote jobs fetched: %d", len(jobs))
+
+        expired_jobs: list[dict] = []
+
+        for job in jobs:
+            # Only consider quotes that have actually been sent to the customer
+            if not job.get("quote_sent"):
+                continue
+
+            expiry_str = job.get("queue_expiry_date", "0000-00-00 00:00:00") or ""
+            if not expiry_str or expiry_str == "0000-00-00 00:00:00":
+                continue
+
+            try:
+                expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
+                expiry_dt = expiry_dt.replace(tzinfo=AEST)
+            except ValueError:
+                continue
+
+            if expiry_dt < now:
+                expired_jobs.append(job)
+
+        logger.info("Expired Quote jobs found: %d", len(expired_jobs))
+
+        if not expired_jobs:
+            logger.info("No expired quotes — nothing to do.")
+            return
+
+        # 2. Mark each expired job as Unsuccessful and collect details ---------
+        dm_lines: list[str] = []
+
+        for job in expired_jobs:
+            job_uuid = job["uuid"]
+            job_number = job.get("generated_job_id", "N/A")
+            address = job.get("job_address", "N/A")
+            client_name = _get_client_name(job.get("company_uuid", ""))
+
+            logger.info(
+                "Marking job %s (%s) as Unsuccessful — quote expired %s",
+                job_number, job_uuid, job.get("queue_expiry_date"),
+            )
+
+            update_resp = _sm8_post(f"job/{job_uuid}.json", json_data={"status": "Unsuccessful"})
+            logger.info("Update result for job %s: %s", job_number, update_resp.status_code)
+
+            dm_lines.append(
+                f"• *Job {job_number}* — {client_name} — {address}\n"
+                f"  Quote expired: {job.get('queue_expiry_date', 'N/A')}"
+            )
+
+        # 3. Send a single DM to Luke with the full summary -------------------
+        header = (
+            f":warning: *Expired Quotes — Auto-marked Unsuccessful*\n"
+            f"_{now.strftime('%A %-d %B %Y, %-I:%M %p')} AEST_\n\n"
+            f"The following {len(dm_lines)} job(s) had expired quotes and have "
+            f"been automatically set to *Unsuccessful*:\n\n"
+        )
+        dm_body = "\n\n".join(dm_lines)
+        _slack_send(SLACK_DM_USER_ID, header + dm_body)
+
+        logger.info("=== Expired-quote check complete — %d jobs updated ===", len(expired_jobs))
+
+    except Exception:
+        logger.exception("Unhandled error in expired-quote check")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Flask routes
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/", methods=["GET"])
 def health() -> Response:
@@ -321,8 +436,8 @@ def webhook() -> Response:
     Main webhook endpoint.
 
     Handles:
-      • ServiceM8 subscription verification  (mode=subscribe + challenge)
-      • inbox.message_received event payloads
+      - ServiceM8 subscription verification  (mode=subscribe + challenge)
+      - inbox.message_received event payloads
     """
     raw = request.get_data(as_text=True)
     content_type = request.content_type or ""
@@ -386,7 +501,23 @@ def webhook() -> Response:
     return Response("OK", status=200)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Scheduler setup
+# ═══════════════════════════════════════════════════════════════════════════════
+
+scheduler = BackgroundScheduler(timezone=AEST)
+
+# Run at 9:00 AM and 5:00 PM AEST every day
+scheduler.add_job(check_expired_quotes, "cron", hour=9, minute=0, id="expire_quotes_9am")
+scheduler.add_job(check_expired_quotes, "cron", hour=17, minute=0, id="expire_quotes_5pm")
+
+scheduler.start()
+logger.info("APScheduler started — expired-quote checks at 9:00 AM and 5:00 PM AEST daily.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point (development only — Render uses gunicorn)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     logger.info("Starting development server on port %s…", PORT)
