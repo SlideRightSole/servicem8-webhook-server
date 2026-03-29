@@ -61,9 +61,9 @@ SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0AQCK3SZUG")
 SLACK_DM_USER_ID = os.environ.get("SLACK_DM_USER_ID", "U07B253U868")  # Luke
 SLACK_DM_SHANNON_ID = os.environ.get("SLACK_DM_SHANNON_ID", "U07K1RUAE31")  # Shannon
 
-# Slack @ mention for Luke — included in all notifications so he receives
-# a proper ping rather than a silent bot message.
+# Slack @ mentions — included in messages so recipients receive proper pings.
 LUKE_MENTION = f"<@{os.environ.get('SLACK_DM_USER_ID', 'U07B253U868')}>"
+SHANNON_MENTION = f"<@{os.environ.get('SLACK_DM_SHANNON_ID', 'U07K1RUAE31')}>"
 
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -646,7 +646,7 @@ def daily_technician_income_report() -> None:
         total_jobs = len(todays_jobs)
 
         lines: list[str] = []
-        lines.append(f"{LUKE_MENTION} :moneybag: *Daily Technician Income Report*")
+        lines.append(f"{SHANNON_MENTION} :moneybag: *Daily Technician Income Report*")
         lines.append(f"_{now.strftime('%A %-d %B %Y')}_ — {total_jobs} job(s) completed\n")
 
         if not todays_jobs:
