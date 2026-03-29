@@ -61,6 +61,10 @@ SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0AQCK3SZUG")
 SLACK_DM_USER_ID = os.environ.get("SLACK_DM_USER_ID", "U07B253U868")  # Luke
 SLACK_DM_SHANNON_ID = os.environ.get("SLACK_DM_SHANNON_ID", "U07K1RUAE31")  # Shannon
 
+# Slack @ mention for Luke — included in all notifications so he receives
+# a proper ping rather than a silent bot message.
+LUKE_MENTION = f"<@{os.environ.get('SLACK_DM_USER_ID', 'U07B253U868')}>"
+
 PORT = int(os.environ.get("PORT", 5000))
 
 # Use the proper IANA timezone so AEDT (+11) / AEST (+10) transitions are
@@ -198,7 +202,7 @@ def _send_new_enquiry_slack(job_number: str, client_name: str, address: str,
                             enquiry_text: str, email: str, phone: str) -> None:
     """Post a new-enquiry notification to the #new-enquiry-received channel."""
     message = (
-        f"*New Online Enquiry Received* :incoming_envelope:\n\n"
+        f"{LUKE_MENTION} *New Online Enquiry Received* :incoming_envelope:\n\n"
         f"*Job Number:* {job_number}\n"
         f"*Client Name:* {client_name}\n"
         f"*Address:* {address}\n"
@@ -565,7 +569,7 @@ def check_expired_quotes() -> None:
 
         # 3. Send a single DM to Luke with the full summary -------------------
         header = (
-            f":warning: *Expired Quotes \u2014 Auto-marked Unsuccessful*\n"
+            f"{LUKE_MENTION} :warning: *Expired Quotes — Auto-marked Unsuccessful*\n"
             f"_{now.strftime('%A %-d %B %Y, %-I:%M %p')} AEST_\n\n"
             f"The following {len(dm_lines)} job(s) had expired quotes and have "
             f"been automatically set to *Unsuccessful*:\n\n"
@@ -642,8 +646,8 @@ def daily_technician_income_report() -> None:
         total_jobs = len(todays_jobs)
 
         lines: list[str] = []
-        lines.append(f":moneybag: *Daily Technician Income Report*")
-        lines.append(f"_{now.strftime('%A %-d %B %Y')}_ \u2014 {total_jobs} job(s) completed\n")
+        lines.append(f"{LUKE_MENTION} :moneybag: *Daily Technician Income Report*")
+        lines.append(f"_{now.strftime('%A %-d %B %Y')}_ — {total_jobs} job(s) completed\n")
 
         if not todays_jobs:
             lines.append("No jobs were completed today.")
