@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""
+ServiceM8 Webhook Server
+========================
+Handles ServiceM8 inbox.message_received webhook events.
+
+For each new inbox message:
+  1. Verifies the ServiceM8 subscription challenge.
+  2. Fetches the inbox message details.
+  3. Converts the message to a job (Quote status).
+  4. Updates the job description with the standard template.
+  5. Sets the work_done_description boilerplate.
+  6. Sends a Slack notification to #new-enquiry-received.
+
+Environment variables (set these in Render's dashboard):
+  SERVICEM8_API_KEY   – ServiceM8 API key  (required)
+  SLACK_CHANNEL_ID    – Slack channel ID for notifications  (required)
+  PORT                – TCP port to listen on (Render sets this automatically)
+"""
+
+import json
+import logging
+import os
+import subprocess
+import threading
+import time
+
+import requests
+from flask import Flask, Response, request
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+SERVICEM8_API_KEY = os.environ.get(
+    "SERVICEM8_API_KEY", "smk-0fa743-cca53e4f1ad199f6-f991a3ae6a206763"
+)
+SERVICEM8_BASE_URL = "https://api.servicem8.com/api_1.0"
+SERVICEM8_HEADERS = {
+    "X-API-Key": SERVICEM8_API_KEY,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0AQCK3SZUG")
+
+PORT = int(os.environ.get("PORT", 5000))
+
+# ── Boilerplate content ────────────────────────────────────────────────────────
+WORK_DONE_DESCRIPTION = (
+    "Peace of Mind Warranty:\n"
+    "All our work comes with a 12-month workmanship warranty \u2014 conditions apply. "
+    "You can rest easy knowing your investment is protected by experienced professionals "
+    "who stand behind their work. Please note that items may be discounted if you request "
+    "a quote for multiple items. If you remove any items, we will send a new quote, and "
+    "prices may change. All quotes are pending site inspection.\n\n"
+    "Pre-Work Site Inspection Notice\n\n"
+    "Important Information About Your Booking\n\n"
+    "All jobs are scheduled with a pre-set time allocation based on a \u201csite unseen\u201d "
+    "basis. To ensure your job can be completed on the day, our technicians will conduct "
+    "a pre-work site inspection upon arrival.\n\n"
+    "Job Categories Following Inspection:\n"
+    "Category 1 \u2013 Clear to Proceed: No visible issues; work is likely to be completed "
+    "within the booked timeframe.\n"
+    "Category 2 \u2013 Proceed with Caution: Some visible issues may affect completion; "
+    "technician will attempt to complete the work, but if not possible, a site inspection "
+    "charge of $120.00 + GST will apply and a re-quote or revisit may be required.\n"
+    "Category 3 \u2013 Not Ready for Work: Clear issues prevent completion; a site inspection "
+    "charge of $120.00 + GST applies and a re-quote will be provided.\n"
+    "Category 4 \u2013 Outside of Scope: The job is too damaged or outside our scope; a site "
+    "inspection fee of $120.00 + GST applies.\n\n"
+    "Please note:\n"
+    "Discounts may apply when quoting for multiple items\n"
+    "If any items are removed from your quote, a revised quote will be issued and pricing "
+    "may change\n"
+    "All quotes are subject to on-site inspection and may be updated based on access or "
+    "job complexity\n\n"
+    "**PLEASE NOTE: Technicians are unable to accept cash. Payment can be made by card "
+    "or bank transfer only**"
+)
+
+JOB_DESCRIPTION_TEMPLATE = """\
+JOB TYPE: 
+
+SERVICE: 
+
+ORIGINAL CUSTOMER ENQUIRY: {enquiry_text}
+
+IMPORTANT INFORMATION (FROM OFFICE):
+
+CATAGORY AFTER SITE INSPECTION:
+
+TECHNICIAN NOTES:
+
+NOTES FOR QUOTING ( Return visit necessary )
+How many technicians needed to complete job:
+How many estimated hours to complete job:
+What parts are required to complete job:
+Are parts stocked in technician van:
+
+OFFICE NOTES
+Parts & material cost:
+Are parts from Bunnings OR Special order:
+"""
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+# ── Flask app ──────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+# Simple in-memory dedup set (resets on restart, which is acceptable)
+_processed_uuids: set = set()
+_processed_lock = threading.Lock()
+
+
+# ── ServiceM8 helpers ──────────────────────────────────────────────────────────
+
+def _sm8_get(path: str) -> requests.Response:
+    url = f"{SERVICEM8_BASE_URL}/{path}"
+    logger.info("GET %s", url)
+    resp = requests.get(url, headers=SERVICEM8_HEADERS, timeout=30)
+    logger.info("GET %s -> %s", url, resp.status_code)
+    return resp
+
+
+def _sm8_post(path: str, json_data: dict | None = None) -> requests.Response:
+    url = f"{SERVICEM8_BASE_URL}/{path}"
+    logger.info("POST %s", url)
+    resp = requests.post(url, headers=SERVICEM8_HEADERS, json=json_data, timeout=30)
+    logger.info("POST %s -> %s", url, resp.status_code)
+    return resp
+
+
+# ── Slack helper ───────────────────────────────────────────────────────────────
+
+def _send_slack(job_number: str, client_name: str, address: str,
+                enquiry_text: str, email: str, phone: str) -> None:
+    """Send a Slack notification via the Manus MCP CLI."""
+    message = (
+        f"*New Online Enquiry Received* :incoming_envelope:\n\n"
+        f"*Job Number:* {job_number}\n"
+        f"*Client Name:* {client_name}\n"
+        f"*Address:* {address}\n"
+        f"*Enquiry:* {enquiry_text}\n"
+        f"*Email:* {email}\n"
+        f"*Phone:* {phone}"
+    )
+    payload = json.dumps({"channel_id": SLACK_CHANNEL_ID, "message": message})
+    try:
+        result = subprocess.run(
+            [
+                "manus-mcp-cli", "tool", "call", "slack_send_message",
+                "--server", "slack",
+                "--input", payload,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        logger.info("Slack result: %s %s", result.stdout[:300], result.stderr[:200])
+    except Exception as exc:
+        logger.error("Slack notification failed: %s", exc)
+
+
+# ── Core processing logic ──────────────────────────────────────────────────────
+
+def _process_inbox_message(uuid: str) -> None:
+    """
+    Full processing pipeline for a single inbox message UUID.
+    Runs in a background thread so the webhook endpoint returns 200 immediately.
+    """
+    try:
+        logger.info("=== Processing inbox message %s ===", uuid)
+
+        # 1. Fetch inbox message -----------------------------------------------
+        resp = _sm8_get(f"inboxmessage/{uuid}.json")
+        if resp.status_code != 200:
+            logger.error("Could not fetch inbox message %s: %s", uuid, resp.status_code)
+            return
+        inbox = resp.json()
+        logger.info(
+            "Inbox message: archived=%s, converted_to_job_uuid=%s",
+            inbox.get("archived"),
+            inbox.get("converted_to_job_uuid"),
+        )
+
+        # 2. Guard: skip archived or already-converted messages ----------------
+        if str(inbox.get("archived", "0")) == "1":
+            logger.info("Message %s is archived — skipping.", uuid)
+            return
+
+        existing_job = inbox.get("converted_to_job_uuid", "") or ""
+        if existing_job and existing_job not in ("", "0"):
+            logger.info("Message %s already converted to job %s — skipping.", uuid, existing_job)
+            return
+
+        # 3. Extract enquiry text ----------------------------------------------
+        enquiry_text = (
+            inbox.get("message_body")
+            or inbox.get("description")
+            or inbox.get("subject")
+            or inbox.get("body")
+            or "No description provided"
+        )
+        logger.info("Enquiry text (first 200 chars): %s", enquiry_text[:200])
+
+        # 4. Convert inbox message to job --------------------------------------
+        logger.info("Converting inbox message %s to job…", uuid)
+        convert_resp = _sm8_post(f"inboxmessage/{uuid}/convert-to-job.json")
+        logger.info(
+            "Convert response: %s — %s",
+            convert_resp.status_code,
+            convert_resp.text[:300],
+        )
+        # The endpoint may return 500 but still succeed; wait briefly then
+        # re-fetch the inbox message to get the generated job UUID.
+        time.sleep(3)
+
+        resp2 = _sm8_get(f"inboxmessage/{uuid}.json")
+        if resp2.status_code != 200:
+            logger.error("Re-fetch of inbox message %s failed: %s", uuid, resp2.status_code)
+            return
+        inbox_updated = resp2.json()
+        job_uuid = inbox_updated.get("converted_to_job_uuid", "") or ""
+
+        # Fallback: try to parse job UUID from the convert response body
+        if not job_uuid or job_uuid in ("", "0"):
+            try:
+                job_uuid = convert_resp.json().get("uuid", "") or ""
+            except Exception:
+                pass
+
+        if not job_uuid or job_uuid in ("", "0"):
+            logger.error("Could not determine job UUID for inbox message %s", uuid)
+            return
+
+        logger.info("Inbox message %s → job %s", uuid, job_uuid)
+
+        # 5. Fetch the new job -------------------------------------------------
+        resp3 = _sm8_get(f"job/{job_uuid}.json")
+        if resp3.status_code != 200:
+            logger.error("Could not fetch job %s: %s", job_uuid, resp3.status_code)
+            return
+        job = resp3.json()
+        logger.info(
+            "Job fetched: generated_job_id=%s, status=%s",
+            job.get("generated_job_id"),
+            job.get("status"),
+        )
+
+        # 6. Update job description + work_done_description --------------------
+        new_description = JOB_DESCRIPTION_TEMPLATE.format(enquiry_text=enquiry_text)
+        update_payload = {
+            "job_description": new_description,
+            "work_done_description": WORK_DONE_DESCRIPTION,
+            "status": "Quote",
+        }
+        update_resp = requests.post(
+            f"{SERVICEM8_BASE_URL}/job/{job_uuid}.json",
+            headers=SERVICEM8_HEADERS,
+            json=update_payload,
+            timeout=30,
+        )
+        logger.info("Job update: %s — %s", update_resp.status_code, update_resp.text[:300])
+
+        # 7. Collect contact details for Slack ---------------------------------
+        job_number = job.get("generated_job_id", "N/A")
+        address = job.get("job_address", "N/A")
+        client_name = email = phone = "N/A"
+
+        company_uuid = job.get("company_uuid", "")
+        if company_uuid:
+            comp_resp = _sm8_get(f"company/{company_uuid}.json")
+            if comp_resp.status_code == 200:
+                comp = comp_resp.json()
+                client_name = comp.get("name") or "N/A"
+                email = comp.get("email") or "N/A"
+                phone = comp.get("phone") or comp.get("mobile") or "N/A"
+
+        # Fall back to inbox message fields if company record is sparse
+        if email == "N/A":
+            email = inbox.get("sender_email") or inbox.get("email") or "N/A"
+        if phone == "N/A":
+            phone = inbox.get("sender_phone") or inbox.get("phone") or "N/A"
+        if client_name == "N/A":
+            client_name = inbox.get("sender_name") or inbox.get("name") or "N/A"
+
+        # 8. Send Slack notification -------------------------------------------
+        _send_slack(
+            job_number=job_number,
+            client_name=client_name,
+            address=address,
+            enquiry_text=enquiry_text[:500],
+            email=email,
+            phone=phone,
+        )
+
+        logger.info(
+            "=== Finished processing inbox message %s → Job %s (%s) ===",
+            uuid, job_number, job_uuid,
+        )
+
+    except Exception:
+        logger.exception("Unhandled error processing inbox message %s", uuid)
+
+
+# ── Flask routes ───────────────────────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def health() -> Response:
+    """Simple health-check endpoint."""
+    return Response("ServiceM8 Webhook Server is running.", status=200)
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook() -> Response:
+    """
+    Main webhook endpoint.
+
+    Handles:
+      • ServiceM8 subscription verification  (mode=subscribe + challenge)
+      • inbox.message_received event payloads
+    """
+    raw = request.get_data(as_text=True)
+    content_type = request.content_type or ""
+    logger.info("Webhook received | Content-Type: %s | body: %s", content_type, raw[:800])
+
+    # Parse body — try JSON first, then form data, then raw JSON parse
+    data: dict = {}
+    if "application/json" in content_type:
+        data = request.get_json(force=False, silent=True) or {}
+    if not data:
+        data = request.form.to_dict() or {}
+    if not data:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+
+    # ── Subscription verification challenge ───────────────────────────────────
+    mode = data.get("mode", "")
+    challenge = data.get("challenge", "")
+    if mode == "subscribe" and challenge:
+        logger.info("Verification challenge — responding with: %s", challenge)
+        return Response(challenge, status=200, content_type="text/plain")
+
+    # ── Extract UUID from eventArgs.entry[0].uuid ─────────────────────────────
+    uuid: str | None = None
+
+    event_args = data.get("eventArgs", {})
+    if isinstance(event_args, dict):
+        entries = event_args.get("entry", [])
+        if isinstance(entries, list) and entries:
+            uuid = entries[0].get("uuid")
+        if not uuid:
+            uuid = event_args.get("uuid")
+
+    # Top-level fallbacks
+    if not uuid:
+        entries = data.get("entry", [])
+        if isinstance(entries, list) and entries:
+            uuid = entries[0].get("uuid")
+    if not uuid:
+        uuid = data.get("uuid")
+
+    if not uuid:
+        logger.warning("No UUID found in payload: %s", raw[:400])
+        return Response("OK", status=200)
+
+    logger.info("Event UUID: %s", uuid)
+
+    # Dedup check
+    with _processed_lock:
+        if uuid in _processed_uuids:
+            logger.info("UUID %s already queued/processed — skipping.", uuid)
+            return Response("OK", status=200)
+        _processed_uuids.add(uuid)
+
+    # Process asynchronously so we return 200 immediately
+    thread = threading.Thread(target=_process_inbox_message, args=(uuid,), daemon=True)
+    thread.start()
+
+    return Response("OK", status=200)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logger.info("Starting development server on port %s…", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
