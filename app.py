@@ -95,7 +95,7 @@ XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
 XERO_SCOPES = (
     "openid profile email offline_access "
-    "accounting.transactions accounting.contacts accounting.settings"
+    "accounting.transactions.read accounting.contacts.read accounting.settings.read"
 )
 
 # Use the proper IANA timezone so AEDT (+11) / AEST (+10) transitions are
