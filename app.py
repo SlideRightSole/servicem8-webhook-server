@@ -1061,6 +1061,11 @@ def webhook() -> Response:
         logger.info("Verification challenge — responding with: %s", challenge)
         return Response(challenge, status=200, content_type="text/plain")
 
+    # !! WEBHOOK PROCESSING DISABLED — all automations halted !!
+    if not AUTOMATIONS_ENABLED:
+        logger.warning("!! WEBHOOK PROCESSING DISABLED — ignoring payload: %s", raw[:200])
+        return Response("OK", status=200)
+
     # ── Extract UUID from eventArgs.entry[0].uuid ─────────────────────────────
     uuid: str | None = None
 
@@ -1118,26 +1123,34 @@ def webhook() -> Response:
 #  Scheduler setup
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# !! AUTOMATIONS DISABLED — set to True to re-enable all scheduled jobs !!
+AUTOMATIONS_ENABLED = False
+
 scheduler = BackgroundScheduler(timezone=AEST)
 
-# Fallback inbox scanner: every 15 minutes
-scheduler.add_job(fallback_inbox_scanner, "interval", minutes=15,
-                  id="fallback_inbox_scanner")
+if AUTOMATIONS_ENABLED:
+    # Fallback inbox scanner: every 15 minutes
+    scheduler.add_job(fallback_inbox_scanner, "interval", minutes=15,
+                      id="fallback_inbox_scanner")
 
-# Expired-quote checks: 9 AM and 5 PM AEST daily
-scheduler.add_job(check_expired_quotes, "cron", hour=9, minute=0, id="expire_quotes_9am")
-scheduler.add_job(check_expired_quotes, "cron", hour=17, minute=0, id="expire_quotes_5pm")
+    # Expired-quote checks: 9 AM and 5 PM AEST daily
+    scheduler.add_job(check_expired_quotes, "cron", hour=9, minute=0, id="expire_quotes_9am")
+    scheduler.add_job(check_expired_quotes, "cron", hour=17, minute=0, id="expire_quotes_5pm")
 
-# Daily technician income report: 5 PM AEST daily
-scheduler.add_job(daily_technician_income_report, "cron", hour=17, minute=0,
-                  id="daily_income_report_5pm")
+    # Daily technician income report: 5 PM AEST daily
+    scheduler.add_job(daily_technician_income_report, "cron", hour=17, minute=0,
+                      id="daily_income_report_5pm")
 
-scheduler.start()
-logger.info(
-    "APScheduler started — fallback inbox scanner every 15 min, "
-    "expired-quote checks at 9 AM & 5 PM AEST, "
-    "daily income report at 5 PM AEST."
-)
+    scheduler.start()
+    logger.info(
+        "APScheduler started — fallback inbox scanner every 15 min, "
+        "expired-quote checks at 9 AM & 5 PM AEST, "
+        "daily income report at 5 PM AEST."
+    )
+else:
+    logger.warning(
+        "!! ALL AUTOMATIONS DISABLED !! Set AUTOMATIONS_ENABLED=True to re-enable."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
