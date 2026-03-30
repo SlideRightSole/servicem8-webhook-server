@@ -913,6 +913,17 @@ def health() -> Response:
     return Response(body, status=200, content_type="text/plain")
 
 
+@app.route("/version", methods=["GET"])
+def version() -> Response:
+    """Returns the current app version and all registered routes."""
+    routes = sorted([r.rule for r in app.url_map.iter_rules()])
+    return Response(
+        json.dumps({"version": APP_VERSION, "routes": routes}),
+        status=200,
+        content_type="application/json",
+    )
+
+
 # ── Xero OAuth 2.0 routes ─────────────────────────────────────────────────────
 
 @app.route("/xero/login", methods=["GET"])
