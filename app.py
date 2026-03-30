@@ -262,6 +262,11 @@ def _send_new_enquiry_slack(job_number: str, client_name: str, address: str,
 # This gives staff time to manually action the message first.
 INBOX_DELAY_MINUTES = int(os.environ.get("INBOX_DELAY_MINUTES", 10))
 
+# Maximum age (in minutes) the fallback scanner will look back.
+# CRITICAL: prevents the scanner from ever processing old/historical messages.
+# Only messages received within this window are eligible for auto-conversion.
+INBOX_MAX_AGE_MINUTES = int(os.environ.get("INBOX_MAX_AGE_MINUTES", 60))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Webhook processing — new enquiry pipeline
@@ -504,11 +509,20 @@ def fallback_inbox_scanner() -> None:
                 )
                 continue
 
+            # CRITICAL safety cap: never process messages older than INBOX_MAX_AGE_MINUTES.
+            # This prevents the scanner from ever touching historical/old messages.
+            if age_minutes > INBOX_MAX_AGE_MINUTES:
+                logger.info(
+                    "Inbox %s is %.1f min old (> %d max) — too old, skipping.",
+                    msg["uuid"][:8], age_minutes, INBOX_MAX_AGE_MINUTES,
+                )
+                continue
+
             candidates.append(msg)
 
         logger.info(
-            "Fallback scanner found %d unactioned inbox message(s) older than %d min.",
-            len(candidates), INBOX_DELAY_MINUTES,
+            "Fallback scanner found %d unactioned inbox message(s) between %d and %d min old.",
+            len(candidates), INBOX_DELAY_MINUTES, INBOX_MAX_AGE_MINUTES,
         )
 
         for msg in candidates:
@@ -1061,7 +1075,7 @@ def webhook() -> Response:
         logger.info("Verification challenge — responding with: %s", challenge)
         return Response(challenge, status=200, content_type="text/plain")
 
-    # !! WEBHOOK PROCESSING DISABLED — all automations halted !!
+    # Kill switch — if automations are disabled, ignore all webhook payloads
     if not AUTOMATIONS_ENABLED:
         logger.warning("!! WEBHOOK PROCESSING DISABLED — ignoring payload: %s", raw[:200])
         return Response("OK", status=200)
@@ -1123,13 +1137,14 @@ def webhook() -> Response:
 #  Scheduler setup
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# !! AUTOMATIONS DISABLED — set to True to re-enable all scheduled jobs !!
-AUTOMATIONS_ENABLED = False
+# Set to False to disable all scheduled jobs and webhook processing (emergency kill switch).
+AUTOMATIONS_ENABLED = True
 
 scheduler = BackgroundScheduler(timezone=AEST)
 
 if AUTOMATIONS_ENABLED:
     # Fallback inbox scanner: every 15 minutes
+    # Only processes messages between INBOX_DELAY_MINUTES and INBOX_MAX_AGE_MINUTES old.
     scheduler.add_job(fallback_inbox_scanner, "interval", minutes=15,
                       id="fallback_inbox_scanner")
 
@@ -1143,9 +1158,10 @@ if AUTOMATIONS_ENABLED:
 
     scheduler.start()
     logger.info(
-        "APScheduler started — fallback inbox scanner every 15 min, "
+        "APScheduler started — fallback inbox scanner every 15 min (lookback: %d-%d min), "
         "expired-quote checks at 9 AM & 5 PM AEST, "
-        "daily income report at 5 PM AEST."
+        "daily income report at 5 PM AEST.",
+        INBOX_DELAY_MINUTES, INBOX_MAX_AGE_MINUTES,
     )
 else:
     logger.warning(
