@@ -13,3 +13,9 @@ services:
         value: U07B253U868
       - key: SLACK_DM_SHANNON_ID
         value: U07K1RUAE31
+      - key: XERO_CLIENT_ID
+        value: E4BC3D0541D9431F8EC6E9396ABFF7AF
+      - key: XERO_CLIENT_SECRET
+        value: YPIJ7JiGGuhVh-ss-t3LSFl9XvdUOCFPQi3EUp63ECrR2Pfj
+      - key: XERO_REDIRECT_URI
+        value: https://servicem8-webhook-server.onrender.com/xero/callback
