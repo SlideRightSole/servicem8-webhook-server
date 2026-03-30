@@ -902,10 +902,15 @@ def _xero_store_tokens(token_data: dict) -> None:
 #  Flask routes
 # ═════════════════════════════════════════════════════════════════════════════
 
+APP_VERSION = "2.0.0-xero"  # bump to force Render redeploy
+
+
 @app.route("/", methods=["GET"])
 def health() -> Response:
-    """Simple health-check endpoint."""
-    return Response("ServiceM8 Webhook Server is running.", status=200)
+    """Simple health-check endpoint — returns version and registered routes."""
+    routes = sorted([r.rule for r in app.url_map.iter_rules()])
+    body = f"ServiceM8 Webhook Server v{APP_VERSION} is running.\nRoutes: {', '.join(routes)}"
+    return Response(body, status=200, content_type="text/plain")
 
 
 # ── Xero OAuth 2.0 routes ─────────────────────────────────────────────────────
