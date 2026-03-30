@@ -1075,9 +1075,9 @@ def webhook() -> Response:
         logger.info("Verification challenge — responding with: %s", challenge)
         return Response(challenge, status=200, content_type="text/plain")
 
-    # Kill switch — if automations are disabled, ignore all webhook payloads
-    if not AUTOMATIONS_ENABLED:
-        logger.warning("!! WEBHOOK PROCESSING DISABLED — ignoring payload: %s", raw[:200])
+    # Kill switch — enquiry processing disabled
+    if not ENQUIRY_PROCESSING_ENABLED:
+        logger.warning("!! ENQUIRY PROCESSING DISABLED — ignoring webhook payload: %s", raw[:200])
         return Response("OK", status=200)
 
     # ── Extract UUID from eventArgs.entry[0].uuid ─────────────────────────────
@@ -1140,28 +1140,36 @@ def webhook() -> Response:
 # Set to False to disable all scheduled jobs and webhook processing (emergency kill switch).
 AUTOMATIONS_ENABLED = True
 
+# !! ENQUIRY PROCESSING DISABLED — webhook and fallback scanner are OFF !!
+# Set to True to re-enable enquiry auto-conversion.
+ENQUIRY_PROCESSING_ENABLED = False
+
 scheduler = BackgroundScheduler(timezone=AEST)
 
 if AUTOMATIONS_ENABLED:
-    # Fallback inbox scanner: every 15 minutes
-    # Only processes messages between INBOX_DELAY_MINUTES and INBOX_MAX_AGE_MINUTES old.
-    scheduler.add_job(fallback_inbox_scanner, "interval", minutes=15,
-                      id="fallback_inbox_scanner")
+    # Fallback inbox scanner: DISABLED via ENQUIRY_PROCESSING_ENABLED flag
+    if ENQUIRY_PROCESSING_ENABLED:
+        scheduler.add_job(fallback_inbox_scanner, "interval", minutes=15,
+                          id="fallback_inbox_scanner")
+        logger.info("Fallback inbox scanner enabled (lookback: %d-%d min).",
+                    INBOX_DELAY_MINUTES, INBOX_MAX_AGE_MINUTES)
+    else:
+        logger.warning("!! FALLBACK INBOX SCANNER DISABLED — ENQUIRY_PROCESSING_ENABLED=False !!")
 
-    # Expired-quote checks: 9 AM and 5 PM AEST daily
+    # Expired-quote checks: 9 AM and 5 PM AEST daily — ALWAYS ON
     scheduler.add_job(check_expired_quotes, "cron", hour=9, minute=0, id="expire_quotes_9am")
     scheduler.add_job(check_expired_quotes, "cron", hour=17, minute=0, id="expire_quotes_5pm")
 
-    # Daily technician income report: 5 PM AEST daily
+    # Daily technician income report: 5 PM AEST daily — ALWAYS ON
     scheduler.add_job(daily_technician_income_report, "cron", hour=17, minute=0,
                       id="daily_income_report_5pm")
 
     scheduler.start()
     logger.info(
-        "APScheduler started — fallback inbox scanner every 15 min (lookback: %d-%d min), "
-        "expired-quote checks at 9 AM & 5 PM AEST, "
-        "daily income report at 5 PM AEST.",
-        INBOX_DELAY_MINUTES, INBOX_MAX_AGE_MINUTES,
+        "APScheduler started — expired-quote checks at 9 AM & 5 PM AEST, "
+        "daily income report at 5 PM AEST. "
+        "Enquiry processing: %s.",
+        "ENABLED" if ENQUIRY_PROCESSING_ENABLED else "DISABLED",
     )
 else:
     logger.warning(
