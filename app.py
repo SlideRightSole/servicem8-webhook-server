@@ -1048,10 +1048,18 @@ def xero_token():
     """Return a valid Xero access token and tenant ID for API calls."""
     token = xero_get_valid_token()
     if not token:
-        return jsonify({"error": "Xero not connected or token refresh failed"}), 401
+        return Response(
+            json.dumps({"error": "Xero not connected or token refresh failed"}),
+            status=401,
+            content_type="application/json",
+        )
     with _xero_token_lock:
         tenant_id = _xero_tokens.get("tenant_id", "")
-    return jsonify({"access_token": token, "tenant_id": tenant_id})
+    return Response(
+        json.dumps({"access_token": token, "tenant_id": tenant_id}),
+        status=200,
+        content_type="application/json",
+    )
 
 
 @app.route("/webhook", methods=["POST"])
