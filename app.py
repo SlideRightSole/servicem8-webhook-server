@@ -1043,6 +1043,17 @@ def xero_status():
     )
 
 
+@app.route("/xero/token", methods=["GET"])
+def xero_token():
+    """Return a valid Xero access token and tenant ID for API calls."""
+    token = xero_get_valid_token()
+    if not token:
+        return jsonify({"error": "Xero not connected or token refresh failed"}), 401
+    with _xero_token_lock:
+        tenant_id = _xero_tokens.get("tenant_id", "")
+    return jsonify({"access_token": token, "tenant_id": tenant_id})
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook() -> Response:
     """
